@@ -1,1 +1,14 @@
-skip-check.bat
+# 含连接凭据的 bat 脚本，禁止入库
+qbittorrent-skip-hash-check.bat
+qbittorrent-tracker-tagger.bat
+
+# 脚本运行产物
+qb_tracker_issues.xlsx
+checking.xlsx
+forced.xlsx
+
+# 临时调试文件
+_collect_tmp.py
+_collect_result.txt
+_verify_tmp.py
+_verify_result.txt
