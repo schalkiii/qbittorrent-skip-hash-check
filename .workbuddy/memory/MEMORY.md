@@ -27,3 +27,14 @@ token 对**单次脚本运行**收益可忽略（省 1 次登录往返 + 服务�
 - `qb_auth.py` 共享鉴权（新增，2026-11-01）
 - `qbittorrent-skip-hash-check.py/.bat` 跳过校验（删除后重导入，skip_checking）
 - `qbittorrent-tracker-tagger.py/.bat` 按 tracker 错误分类打标签，7 类，只打标签不删除
+- `qbittorrent-tracker-url-replacer.py/.bat` 批量替换 tracker 域名，保留 passkey
+
+## WebAPI 坑位（实测 v5.3.0 / WebAPI 2.16.2）
+- **成功判定一律用 2xx**：`auth/login`、`torrents/editTracker` 成功都返回 **204**，不是 200+"Ok."。
+- `editTracker` 参数是 `hash` + **`url`**（旧地址）+ `newUrl`；`origUrl` 属于 editWebSeed，别混用。
+- `editTracker` 只 forceReannounce，**不 recheck/rehash**；新 URL 已存在时返回 Conflict（幂等可跳过）。
+- 旧域名不存在 → `Tracker not found`。
+
+## 已完成的操作
+- 2026-11-01：`t.hddolby.com` → `www.uhddolby.com` 迁移，408 个种子全部完成，旧域名残留 0。
+  旧域 announce 实测 HTTP 000（不可达），新域 HTTP 200 + bencode 应答，验证通过。
