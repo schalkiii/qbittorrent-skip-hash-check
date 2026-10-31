@@ -30,6 +30,7 @@ Python 3 + requests + pandas + openpyxl。无测试、无构建，直接运行�
 ## 必守的坑（下次别再踩）
 
 - **成功判定用 2xx，不要写死 200**：该版本 `auth/login` 与 `torrents/editTracker` 成功均返回 **204** 且响应体为空。
+- **tracker 错误状态码不要写死 4**：实测 v5.3.0 中错误状态可能是 **5**，错误判定统一用 `status >= 4`。
 - **token 鉴权必须 `Authorization: Bearer`**：实测 `X-API-Key` 头在 v5.3.0 返回 403。
 - **token 不能用于 `auth/` 端点**（403），验证 token 改为探测 `/api/v2/app/version`。
 - **`editTracker` 参数是 `hash` + `url`（旧地址）+ `newUrl`**：`origUrl` 属于 editWebSeed，别混用。
@@ -40,3 +41,5 @@ Python 3 + requests + pandas + openpyxl。无测试、无构建，直接运行�
 
 - qBittorrent v5.3.0 / WebAPI 2.16.2，约 4.1 万种子。
 - 2026-11-01：三个脚本统一接入 `qb_auth.py` 鉴权；新增 tracker 域名批量替换脚本并完成 `t.hddolby.com` → `www.uhddolby.com` 共 408 个种子迁移。
+- 2026-11-01：修复 tagger 漏标问题——错误状态码判定改为 `>= 4`，`已删种` 增补中文模式（`种子不存在` 等），
+  `站点不可达` 增补中文连接错误，`无权限` 增补客户端封禁，`服务端异常` 增补 `Not Found`/bencode 失败。

@@ -44,11 +44,14 @@ REQUEST_RETRIES = 3
 REQUEST_RETRY_DELAY = 1.0
 
 # tracker 状态码含义（qBittorrent WebAPI v2）
+# 实测 v5.3.0：0=禁用 1=未联系 2=工作中 3=更新中 4=不工作 5=错误
+# 注意：部分版本用 4 表示 NotWorking，另一些（含 5.3.0）出现 5 表示错误，
+# 因此错误判定统一用 >= 4，避免漏掉任何版本的错误状态。
 TRACKER_STATUS_DISABLED = 0
 TRACKER_STATUS_NOT_CONTACTED = 1
 TRACKER_STATUS_WORKING = 2
 TRACKER_STATUS_UPDATING = 3
-TRACKER_STATUS_NOT_WORKING = 4
+TRACKER_STATUS_ERROR_MIN = 4  # 4 与 5 均视为错误
 
 # 分类规则表，按列表顺序即为匹配优先级（越靠前优先级越高）
 # 每项：(标签名, 该类含义说明, 关键词正则列表)
@@ -66,6 +69,8 @@ CATEGORY_RULES = [
             r'unregistered torrent',
             r'没有在我们的\s*tracker\s*上注册',
             r'种子未注册',
+            r'种子不存在',
+            r'种子已删除',
         ],
     ),
     (
@@ -87,13 +92,22 @@ CATEGORY_RULES = [
             r'no such host',
             r'stream truncated',
             r'timed out',
+            r'timeout',
             r'connection refused',
+            r'connection reset',
+            r'connection aborted',
             r'temporary failure in name resolution',
+            r'由于连接方在一段时间后没有正确答复或连接的主机没有反应',
+            r'不知道这样的主机。',
+            r'由于连接尝试失败',
+            r'由本地系统中止网络连接',
+            r'目标计算机积极拒绝',
+            r'通常每个套接字地址',
         ],
     ),
     (
         '无权限',
-        'passkey 失效、账号被封或缺少鉴权参数',
+        'passkey 失效、账号被封、客户端不被站点允许或缺少鉴权参数',
         [
             r'forbidden',
             r'unauthorized',
@@ -101,16 +115,26 @@ CATEGORY_RULES = [
             r'invalid passkey',
             r'passkey',
             r'access denied',
+            r'not allow',
+            r'not allowed',
+            r'client.*not.*allow',
+            r'is banned',
+            r'banned client',
         ],
     ),
     (
         '服务端异常',
-        '站点服务器临时故障，通常可自行恢复',
+        '站点服务器临时故障或返回了无法解析的响应，通常可自行恢复',
         [
             r'bad gateway',
             r'service unavailable',
             r'internal server error',
             r'gateway time-?out',
+            r'not found',
+            r'<none>',
+            r'bencoded string',
+            r'invalid response',
+            r'malformed',
             r'502',
             r'503',
         ],
@@ -212,11 +236,17 @@ def collect_issues(client, torrents, progress_step):
                 continue
             status = tr.get('status')
             msg = (tr.get('msg') or '').strip()
-            is_error = (status == TRACKER_STATUS_NOT_WORKING)
+            # 错误：状态码 4 或 5（部分版本用 5 表示错误）
+            # 警告：状态码非错误但 tracker 返回了消息（如汇报过频）
+            is_error = (status >= TRACKER_STATUS_ERROR_MIN)
             if not is_error and not msg:
                 continue
 
-            name = classify_message(msg)
+            # 空消息但状态为错误：视为服务端异常（tracker 未给出具体原因）
+            if is_error and not msg:
+                name = '服务端异常'
+            else:
+                name = classify_message(msg)
             if name not in hit_names:
                 hit_names.append(name)
 

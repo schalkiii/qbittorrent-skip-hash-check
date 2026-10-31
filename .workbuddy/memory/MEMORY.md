@@ -31,9 +31,16 @@ token 对**单次脚本运行**收益可忽略（省 1 次登录往返 + 服务�
 
 ## WebAPI 坑位（实测 v5.3.0 / WebAPI 2.16.2）
 - **成功判定一律用 2xx**：`auth/login`、`torrents/editTracker` 成功都返回 **204**，不是 200+"Ok."。
+- **tracker 错误状态码不要写死 4**：实测 v5.3.0 中错误状态可能是 **5**，判定用 `status >= 4`。
+  写死 4 会漏判 status=5 的错误（已删种/客户端封禁等），这是 2026-11-01 漏标根因。
 - `editTracker` 参数是 `hash` + **`url`**（旧地址）+ `newUrl`；`origUrl` 属于 editWebSeed，别混用。
 - `editTracker` 只 forceReannounce，**不 recheck/rehash**；新 URL 已存在时返回 Conflict（幂等可跳过）。
 - 旧域名不存在 → `Tracker not found`。
+
+## tracker 消息分类（tagger 规则，7 类按优先级）
+已删种 > 审核未通过 > 站点不可达 > 无权限 > 服务端异常 > 汇报过频 > 其他。
+关键模式：已删种须含中文 `种子不存在`/`种子未注册`/`种子已删除`（PTT 站用中文）；
+`Not Found` 归服务端异常（404）；空消息+错误状态归服务端异常；`not allow` 归无权限。
 
 ## 已完成的操作
 - 2026-11-01：`t.hddolby.com` → `www.uhddolby.com` 迁移，408 个种子全部完成，旧域名残留 0。

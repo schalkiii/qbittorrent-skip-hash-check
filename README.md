@@ -151,6 +151,20 @@ python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --token qbt_xx
 | `--clear-old`  | 打标签前先清理本脚本此前打的标签              |
 | `--multi-tag`  | 命中多类时全部打上（默认只打优先级最高的一个）|
 
+#### 分类规则（7 类，按优先级排序）
+
+| 分类 | 典型消息 |
+| ---- | -------- |
+| `已删种` | `Torrent not exists`、`PTT:种子不存在`、`torrent not registered`、`种子未注册` |
+| `审核未通过` | `review not approved`、含"审核" |
+| `站点不可达` | `不知道这样的主机`、`connection refused`、中文连接超时/拒绝 |
+| `无权限` | `Forbidden`、`invalid passkey`、`Client ... is not allow` |
+| `服务端异常` | `Bad Gateway`、`Not Found`、bencode 解析失败 |
+| `汇报过频` | `Request too frequent`、`minimum announce time` |
+| `其他` | 未匹配的兜底，多数实为正常应答 |
+
+错误状态判定使用 `status >= 4`（部分 qB 版本用 5 表示错误，写死 4 会漏判）。
+
 ### Tracker URL Replacer 用法（站点换域名时迁移）
 
 只替换 URL 的 **host 字段**，`passkey`、路径、查询串原样保留。
