@@ -1,11 +1,17 @@
 # 含连接凭据的 bat 脚本，禁止入库
 qbittorrent-skip-hash-check.bat
 qbittorrent-tracker-tagger.bat
+qbittorrent-tracker-url-replacer.bat
 
-# 脚本运行产物
+# 脚本运行产物（xlsx/json 含种子明细与 passkey，禁止入库）
 qb_tracker_issues.xlsx
 checking.xlsx
 forced.xlsx
+tracker_replace_result.xlsx
+tracker_replace_backup.json
+
+# Python 缓存
+__pycache__/
 
 # 临时调试文件
 _collect_tmp.py

@@ -6,38 +6,44 @@
 # 2. 跳过校验中的种子（将其改为做种状态）
 # 3. 解除强制做种状态（改为普通做种状态）
 
-# 用法示例：
+# 鉴权：支持 API token（qBittorrent >= 5.2.0，推荐）与 用户名+密码，同时提供时 token 优先
+#
+# 用法示例（用 --token 或 --username/--password 均可）：
 # 1. 将校验状态种子改为做种状态（预览模式）：
-#    python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --username admin --password YOUR_PASSWORD --filter checking --out checking.xlsx
+#    python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --filter checking --out checking.xlsx
 # 2. 实际执行跳过校验（确认无误后加上--skip-check）：
-#    python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --username admin --password YOUR_PASSWORD --filter checking --out checking.xlsx --skip-check
+#    python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --filter checking --out checking.xlsx --skip-check
 # 3. 解除强制做种状态（预览模式）
-#    python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --username admin --password YOUR_PASSWORD --filter forced --out forced.xlsx
+#    python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --filter forced --out forced.xlsx
 # 4. 实际执行解除强制做种（确认无误后加上--skip-forced）：
-#    python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --username admin --password YOUR_PASSWORD --filter forced --out forced.xlsx --skip-forced
+#    python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --filter forced --out forced.xlsx --skip-forced
 
 # 过滤选项: checking, completed, forced, all
 
-import requests
-import argparse
 import sys
+import os
+
+# 保证可从任意工作目录导入同目录下的 qb_auth 模块
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import argparse
 import time
 import pandas as pd
 
-def login(session, base_url, username, password):
-    url = base_url.rstrip('/') + '/api/v2/auth/login'
-    r = session.post(url, data={'username': username, 'password': password})
-    if r.status_code != 200 or 'Ok.' not in r.text:
-        raise RuntimeError(f'登录失败: {r.status_code} {r.text}')
-    return True
+from qb_auth import QBClient, add_auth_args, build_client_from_args
 
-def fetch_torrents(session, base_url):
-    url = base_url.rstrip('/') + '/api/v2/torrents/info'
-    r = session.get(url)
+# Windows 控制台默认 GBK 编码，无法输出 emoji 等字符，统一改为 UTF-8 并对不可编码字符降级
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+def fetch_torrents(client):
+    """拉取全部种子信息。41015 个种子时响应可达数十 MB，读取超时已放宽至 60s。"""
+    r = client.get('/api/v2/torrents/info')
     r.raise_for_status()
     return r.json()
 
-def skip_reimport(session, base_url, torrents):
+def skip_reimport(client, torrents):
     """
     删除并重新导入种子，利用 skip_checking 跳过校验
     """
@@ -46,31 +52,29 @@ def skip_reimport(session, base_url, torrents):
         torrent_hash = t['hash']
         save_path = t['save_path']
         torrent_name = t['name']
-        
+
         # 导出种子文件
-        dl_url = base_url.rstrip('/') + '/api/v2/torrents/export'
-        r = session.get(dl_url, params={'hash': torrent_hash})
+        r = client.get('/api/v2/torrents/export', params={'hash': torrent_hash})
         if r.status_code != 200:
             print(f"❌ 获取种子失败 {torrent_name}: {r.text}")
             continue
         torrent_file = r.content
-        
+
         # 删除种子 (不删文件)
-        del_url = base_url.rstrip('/') + '/api/v2/torrents/delete'
-        r = session.post(del_url, data={'hashes': torrent_hash, 'deleteFiles': 'false'})
+        r = client.post('/api/v2/torrents/delete',
+                        data={'hashes': torrent_hash, 'deleteFiles': 'false'})
         if r.status_code != 200:
             print(f"❌ 删除种子失败 {torrent_name}: {r.text}")
             continue
-        
+
         # 重新添加，跳过校验
-        add_url = base_url.rstrip('/') + '/api/v2/torrents/add'
         files = {'torrents': (f"{torrent_name}.torrent", torrent_file, 'application/x-bittorrent')}
         data = {'savepath': save_path, 'skip_checking': 'true'}
-        r = session.post(add_url, data=data, files=files)
+        r = client.post('/api/v2/torrents/add', data=data, files=files)
         if r.status_code != 200:
             print(f"❌ 重新添加失败 {torrent_name}: {r.text}")
             continue
-        
+
         print(f"✅ 已跳过校验并重新导入: {torrent_name}")
         count += 1
     return count
@@ -101,8 +105,7 @@ def nice_bytes(n):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--host','-H', required=True, help='qBittorrent Web UI 地址，例如 http://127.0.0.1:8080')
-    p.add_argument('--username','-u', required=True)
-    p.add_argument('--password','-p', required=True)
+    add_auth_args(p)
     p.add_argument('--filter','-f',
                    choices=['checking','completed','forced','all'],
                    default='checking',
@@ -113,29 +116,31 @@ def main():
     p.add_argument('--skip-forced', action='store_true', help='跳过所有强制做种的种子')
     
     args = p.parse_args()
-    s = requests.Session()
-    
+    client = build_client_from_args(args)
+    print(f'鉴权方式: {"API token" if client.auth_mode == "token" else "用户名密码(Cookie 会话)"}')
+
     try:
-        login(s, args.host, args.username, args.password)
-    except Exception as e:
-        print('登录失败:', e)
-        sys.exit(1)
-    
-    torrents = fetch_torrents(s, args.host)
-    
+        run(client, args)
+    finally:
+        # Cookie 模式下主动登出，避免服务端会话堆积；token 模式无状态，无需处理
+        client.logout()
+
+def run(client, args):
+    torrents = fetch_torrents(client)
+
     # 跳过校验中的种子
     if args.skip_check:
         checking_torrents = [t for t in torrents if t.get('state') in ('checkingDL','checkingUP')]
-        count = skip_reimport(s, args.host, checking_torrents)
+        count = skip_reimport(client, checking_torrents)
         print(f'已跳过 {count} 个校验中的种子')
-        torrents = fetch_torrents(s, args.host)  # 重新获取最新状态
-    
+        torrents = fetch_torrents(client)  # 重新获取最新状态
+
     # 跳过强制做种的种子
     if args.skip_forced:
         forced_torrents = [t for t in torrents if t.get('state') == 'forcedUP']
-        count = skip_reimport(s, args.host, forced_torrents)
+        count = skip_reimport(client, forced_torrents)
         print(f'已跳过 {count} 个强制做种的种子')
-        torrents = fetch_torrents(s, args.host)  # 重新获取最新状态
+        torrents = fetch_torrents(client)  # 重新获取最新状态
     
     # 导出逻辑
     rows = []

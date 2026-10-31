@@ -6,22 +6,30 @@
 # 2. 按预置规则将 tracker 错误/警告归类（已删种、审核未通过、站点不可达等 7 类）
 # 3. 为命中的种子打上对应中文标签，并将明细导出到 Excel
 
-# 用法示例：
+# 鉴权：支持 API token（qBittorrent >= 5.2.0，推荐）与 用户名+密码，同时提供时 token 优先
+#
+# 用法示例（用 --token 或 --username/--password 均可）：
 # 1. 预览模式（不打标签，仅导出 Excel）：
-#    python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --username admin --password YOUR_PASSWORD --dry-run
+#    python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --dry-run
 # 2. 默认模式（打标签 + 导出 Excel）：
-#    python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --username admin --password YOUR_PASSWORD
+#    python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx
 # 3. 重新分类前先清理本脚本此前打的标签：
-#    python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --username admin --password YOUR_PASSWORD --clear-old
+#    python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --clear-old
 # 4. 一个种子命中多类时全部打上（默认只打优先级最高的一个）：
-#    python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --username admin --password YOUR_PASSWORD --multi-tag
+#    python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --multi-tag
 
-import requests
-import argparse
 import sys
+import os
+
+# 保证可从任意工作目录导入同目录下的 qb_auth 模块
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import argparse
 import re
 import time
 import pandas as pd
+
+from qb_auth import add_auth_args, build_client_from_args
 
 # Windows 控制台默认 GBK 编码，无法输出 emoji 等字符，统一改为 UTF-8 并对不可编码字符降级
 if hasattr(sys.stdout, 'reconfigure'):
@@ -140,32 +148,22 @@ COMPILED_RULES = [
 ALL_TAGS = [TAG_PREFIX + name for name, _, _ in CATEGORY_RULES]
 
 
-def login(session, base_url, username, password):
-    url = base_url.rstrip('/') + '/api/v2/auth/login'
-    r = session.post(url, data={'username': username, 'password': password},
-                     headers={'Referer': base_url.rstrip('/')})
-    if r.status_code != 200 or 'Ok.' not in r.text:
-        raise RuntimeError(f'登录失败: {r.status_code} {r.text}')
-    return True
-
-
-def fetch_torrents(session, base_url):
-    url = base_url.rstrip('/') + '/api/v2/torrents/info'
-    r = session.get(url)
+def fetch_torrents(client):
+    """拉取全部种子信息。41015 个种子时响应可达数十 MB，读取超时已放宽至 60s。"""
+    r = client.get('/api/v2/torrents/info')
     r.raise_for_status()
     return r.json()
 
 
-def fetch_trackers(session, base_url, torrent_hash):
+def fetch_trackers(client, torrent_hash):
     """
     读取单个种子的 tracker 列表。
     种子数量巨大时 qb 偶发 502，故加入有限重试而非直接放弃该种子。
     """
-    url = base_url.rstrip('/') + '/api/v2/torrents/trackers'
     last_error = None
     for attempt in range(REQUEST_RETRIES):
         try:
-            r = session.get(url, params={'hash': torrent_hash})
+            r = client.get('/api/v2/torrents/trackers', params={'hash': torrent_hash})
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -187,7 +185,7 @@ def classify_message(msg):
     return FALLBACK_CATEGORY
 
 
-def collect_issues(session, base_url, torrents, progress_step):
+def collect_issues(client, torrents, progress_step):
     """
     遍历种子读取 tracker 信息，收集所有状态异常的条目。
     异常定义：status=4（错误），或 msg 非空（警告）。
@@ -201,7 +199,7 @@ def collect_issues(session, base_url, torrents, progress_step):
     for index, t in enumerate(torrents):
         torrent_hash = t['hash']
         try:
-            trackers = fetch_trackers(session, base_url, torrent_hash)
+            trackers = fetch_trackers(client, torrent_hash)
         except Exception as e:
             failed.append((t.get('name', ''), torrent_hash, str(e)))
             continue
@@ -251,28 +249,25 @@ def collect_issues(session, base_url, torrents, progress_step):
     return rows, tag_map, failed
 
 
-def create_tags(session, base_url, tags):
+def create_tags(client, tags):
     """预创建标签，避免部分 qb 版本在 addTags 时静默失败"""
-    url = base_url.rstrip('/') + '/api/v2/torrents/createTags'
-    r = session.post(url, data={'tags': ','.join(tags)})
+    r = client.post('/api/v2/torrents/createTags', data={'tags': ','.join(tags)})
     return r.status_code == 200
 
 
-def add_tags(session, base_url, hashes, tag):
+def add_tags(client, hashes, tag):
     """为一批种子添加同一个标签"""
-    url = base_url.rstrip('/') + '/api/v2/torrents/addTags'
-    r = session.post(url, data={'hashes': '|'.join(hashes), 'tags': tag})
+    r = client.post('/api/v2/torrents/addTags', data={'hashes': '|'.join(hashes), 'tags': tag})
     return r.status_code == 200
 
 
-def remove_tags(session, base_url, hashes, tag):
+def remove_tags(client, hashes, tag):
     """从一批种子上移除同一个标签（仅解除关联，不影响种子本身）"""
-    url = base_url.rstrip('/') + '/api/v2/torrents/removeTags'
-    r = session.post(url, data={'hashes': '|'.join(hashes), 'tags': tag})
+    r = client.post('/api/v2/torrents/removeTags', data={'hashes': '|'.join(hashes), 'tags': tag})
     return r.status_code == 200
 
 
-def clear_old_tags(session, base_url, torrents, batch_size):
+def clear_old_tags(client, torrents, batch_size):
     """
     清理本脚本此前打的标签。
     仅对当前带有这些标签的种子执行 removeTags，不做任何删除操作。
@@ -285,14 +280,14 @@ def clear_old_tags(session, base_url, torrents, batch_size):
             continue
         for i in range(0, len(hashes), batch_size):
             batch = hashes[i:i + batch_size]
-            if remove_tags(session, base_url, batch, tag):
+            if remove_tags(client, batch, tag):
                 cleared += len(batch)
             else:
                 print(f'[失败] 移除标签: {tag} (共 {len(batch)} 个)')
     return cleared
 
 
-def apply_tags(session, base_url, tag_map, multi_tag, batch_size):
+def apply_tags(client, tag_map, multi_tag, batch_size):
     """
     按标签分组批量打标签。
     multi_tag=False 时每个种子只打优先级最高的标签。
@@ -307,14 +302,14 @@ def apply_tags(session, base_url, tag_map, multi_tag, batch_size):
     if not grouped:
         return {}
 
-    create_tags(session, base_url, list(grouped.keys()))
+    create_tags(client, list(grouped.keys()))
 
     result = {}
     for tag, hashes in grouped.items():
         tagged = 0
         for i in range(0, len(hashes), batch_size):
             batch = hashes[i:i + batch_size]
-            if add_tags(session, base_url, batch, tag):
+            if add_tags(client, batch, tag):
                 tagged += len(batch)
             else:
                 print(f'[失败] 打标签: {tag} (共 {len(batch)} 个)')
@@ -381,8 +376,7 @@ def main():
     p = argparse.ArgumentParser(
         description='根据 tracker 返回信息对 qBittorrent 种子分类打标签（只打标签，不做任何删除）')
     p.add_argument('--host', '-H', required=True, help='qBittorrent Web UI 地址，例如 http://127.0.0.1:8080')
-    p.add_argument('--username', '-u', required=True)
-    p.add_argument('--password', '-p', required=True)
+    add_auth_args(p)
     p.add_argument('--out', '-o', default='qb_tracker_issues.xlsx', help='输出Excel文件名')
     p.add_argument('--dry-run', action='store_true', help='预览模式：只导出Excel，不打任何标签')
     p.add_argument('--clear-old', action='store_true', help='打标签前先清理本脚本此前打的标签')
@@ -391,26 +385,28 @@ def main():
     p.add_argument('--progress-step', type=int, default=5000, help='扫描进度打印间隔，0 表示不打印')
 
     args = p.parse_args()
-    s = requests.Session()
+    client = build_client_from_args(args)
+    print(f'鉴权方式: {"API token" if client.auth_mode == "token" else "用户名密码(Cookie 会话)"}')
 
     try:
-        login(s, args.host, args.username, args.password)
-    except Exception as e:
-        print('登录失败:', e)
-        sys.exit(1)
+        run(client, args)
+    finally:
+        # Cookie 模式下主动登出，避免服务端会话堆积；token 模式无状态，无需处理
+        client.logout()
 
-    torrents = fetch_torrents(s, args.host)
+def run(client, args):
+    torrents = fetch_torrents(client)
     print(f'共 {len(torrents)} 个种子，开始扫描 tracker 状态...')
 
     if args.clear_old:
         if args.dry_run:
             print('预览模式：跳过清理旧标签')
         else:
-            cleared = clear_old_tags(s, args.host, torrents, args.batch_size)
+            cleared = clear_old_tags(client, torrents, args.batch_size)
             print(f'已清理旧标签关联 {cleared} 次')
-            torrents = fetch_torrents(s, args.host)  # 重新获取最新标签状态
+            torrents = fetch_torrents(client)  # 重新获取最新标签状态
 
-    rows, tag_map, failed = collect_issues(s, args.host, torrents, args.progress_step)
+    rows, tag_map, failed = collect_issues(client, torrents, args.progress_step)
 
     if failed:
         print(f'\n[警告] {len(failed)} 个种子的 tracker 读取失败（重试后仍失败），已跳过：')
@@ -437,7 +433,7 @@ def main():
         return
 
     print('\n开始打标签...')
-    apply_tags(s, args.host, tag_map, args.multi_tag, args.batch_size)
+    apply_tags(client, tag_map, args.multi_tag, args.batch_size)
     print('打标签完成（未执行任何删除操作）')
 
 

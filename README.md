@@ -22,6 +22,17 @@
 - **解除强制做种**：将强制做种的种子改为普通做种状态
 - **批量处理**：支持一次性处理多个种子
 
+### 组件
+
+| 文件 | 说明 |
+| ---- | ---- |
+| `qb_auth.py` | 共享鉴权模块，三个脚本复用 |
+| `qbittorrent-skip-hash-check.py/.bat` | 跳过校验 / 解除强制做种 |
+| `qbittorrent-tracker-tagger.py/.bat` | 按 tracker 错误信息分类打标签（只打标签，不删除） |
+| `qbittorrent-tracker-url-replacer.py/.bat` | 批量替换 tracker 域名，保留 passkey |
+
+`.bat` 一键脚本内含连接凭据，已在 `.gitignore` 中排除，不入库。
+
 ## 环境要求
 
 - Python 3.6+
@@ -31,6 +42,47 @@
 pip install requests pandas openpyxl
 ```
 
+## 鉴权方式
+
+支持两种方式，**同时提供时 API token 优先**（与服务端行为一致）。
+
+### 1. API token（推荐，qBittorrent >= 5.2.0 / WebAPI >= v2.14.1）
+
+在 WebUI → 设置 → Web UI → API Key 处生成，格式为 `qbt_` 前缀 + 28 位字符（共 32 字符）。
+
+```bash
+python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --filter checking --out checking.xlsx
+```
+
+注意事项：
+
+- 请求头为 `Authorization: Bearer <token>`。实测 `X-API-Key` 头在 v5.3.0 上返回 403，故统一使用 Bearer。
+- token **不能用于 `auth/` 端点**（`login`/`logout` 会返回 403），因此脚本改用 `app/version` 探测 token 有效性。
+- 重新生成 API key 会立即作废旧 key。
+- 低版本 qBittorrent（< 5.2.0）不支持，会自动回退到用户名密码。
+
+### 2. 用户名 + 密码（传统 Cookie 会话）
+
+```bash
+python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --username admin --password YOUR_PASSWORD
+```
+
+兼容新旧登录响应：旧版返回 `200 + "Ok."`，4.6+ 返回 `204` 且响应体为空。脚本结束时主动登出，避免服务端会话堆积。
+
+### 关于性能
+
+token 鉴权**对脚本单次运行的性能提升非常有限**，主要价值在可靠性：
+
+| 维度 | 用户名密码 | API token |
+| ---- | ---------- | --------- |
+| 登录往返 | 1 次额外 HTTP 往返 | 无 |
+| 服务端密码校验 | PBKDF2 哈希，约 5–50ms CPU | 常量时间字符串比较，微秒级 |
+| 会话管理 | 每次运行新建会话并下发 Cookie | 以 token 为 ID 复用同一会话 |
+| 失败封禁 | 连续失败达阈值会封禁来源 IP | 不触发失败计数 |
+| 单次脚本运行总收益 | — | 约省 10–100ms（局域网） |
+
+结论：对一次性脚本，收益在总耗时中占比可忽略（本库 4 万多种子，扫描耗时以分钟计）。真正受益的是**高频轮询 / 常驻集成**场景（每分钟请求一次可省下持续的登录开销与哈希 CPU），以及避免会话堆积和误封 IP。
+
 ## 使用方法
 
 ### 基本参数
@@ -38,8 +90,9 @@ pip install requests pandas openpyxl
 | 参数            | 说明                                                |
 | --------------- | --------------------------------------------------- |
 | `--host`        | qBittorrent Web UI 地址，如 `http://127.0.0.1:8080` |
-| `--username`    | 用户名                                              |
-| `--password`    | 密码                                                |
+| `--token`       | API token（>= 5.2.0），优先于用户名密码             |
+| `--username`    | 用户名（未提供 token 时必填）                       |
+| `--password`    | 密码（未提供 token 时必填）                         |
 | `--filter`      | 过滤类型：`checking`、`completed`、`forced`、`all`  |
 | `--out`         | 输出 Excel 文件名                                   |
 | `--skip-check`  | 跳过校验中的种子                                    |
@@ -56,29 +109,83 @@ pip install requests pandas openpyxl
 
 ### 使用示例
 
+下面示例统一使用 `--token`，也可替换为 `--username admin --password 123456`。
+
 **1. 预览模式 - 查看校验中的种子**
 
 ```bash
-python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --username admin --password 123456 --filter checking --out checking.xlsx
+python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --filter checking --out checking.xlsx
 ```
 
 **2. 执行模式 - 跳过校验**
 
 ```bash
-python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --username admin --password 123456 --filter checking --out checking.xlsx --skip-check
+python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --filter checking --out checking.xlsx --skip-check
 ```
 
 **3. 预览模式 - 查看强制做种的种子**
 
 ```bash
-python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --username admin --password 123456 --filter forced --out forced.xlsx
+python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --filter forced --out forced.xlsx
 ```
 
 **4. 执行模式 - 解除强制做种**
 
 ```bash
-python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --username admin --password 123456 --filter forced --out forced.xlsx --skip-forced
+python qbittorrent-skip-hash-check.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --filter forced --out forced.xlsx --skip-forced
 ```
+
+### Tracker Tagger 用法
+
+```bash
+REM 预览：只导出 Excel，不打标签
+python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --dry-run
+
+REM 打标签前先清理旧标签，再重新分类
+python qbittorrent-tracker-tagger.py --host http://127.0.0.1:8080 --token qbt_xxxxxxxx --clear-old
+```
+
+| 参数           | 说明                                          |
+| -------------- | --------------------------------------------- |
+| `--dry-run`    | 预览模式，只导出 Excel，不打任何标签          |
+| `--clear-old`  | 打标签前先清理本脚本此前打的标签              |
+| `--multi-tag`  | 命中多类时全部打上（默认只打优先级最高的一个）|
+
+### Tracker URL Replacer 用法（站点换域名时迁移）
+
+只替换 URL 的 **host 字段**，`passkey`、路径、查询串原样保留。
+
+```bash
+REM 1. 预览：列出将被修改的种子，不做任何改动
+python qbittorrent-tracker-url-replacer.py --host http://127.0.0.1:8080 --token qbt_xxx \
+    --old-host t.hddolby.com --new-host www.uhddolby.com
+
+REM 2. 小批量试验（默认 2 个），改完立即复核
+python qbittorrent-tracker-url-replacer.py --host ... --token qbt_xxx \
+    --old-host t.hddolby.com --new-host www.uhddolby.com --canary
+
+REM 3. 确认无误后批量执行
+python qbittorrent-tracker-url-replacer.py --host ... --token qbt_xxx \
+    --old-host t.hddolby.com --new-host www.uhddolby.com --apply
+```
+
+| 参数              | 说明                                        |
+| ----------------- | ------------------------------------------- |
+| `--old-host`      | 旧域名，如 `t.hddolby.com`                  |
+| `--new-host`      | 新域名，如 `www.uhddolby.com`               |
+| `--canary`        | 试验模式，只改前 N 个并复核（默认 2 个）    |
+| `--apply`         | 批量执行（默认需交互输入 yes，`--yes` 跳过）|
+| `--backup`        | 变更前计划备份 JSON，便于审计               |
+
+安全设计：
+
+- 只处理 tracker URL 命中旧域名的种子，其余一律不触碰
+- 变更前导出完整映射备份 JSON
+- 服务端保证不重复添加：新 URL 已存在时返回 Conflict，脚本记为「跳过」
+- `editTracker` 只触发 `forceReannounce`，**不会 recheck/rehash**，已下载数据不受影响
+- 执行后自动复核：确认新 URL 生效且旧 URL 已消失
+
+注意：`editTracker` 的参数是 `hash` + **`url`**（旧地址）+ `newUrl`；`origUrl` 属于 `editWebSeed`，不可混用。
 
 ## 工作原理
 
