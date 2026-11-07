@@ -34,8 +34,13 @@ Python 3 + requests + pandas + openpyxl。无测试、无构建，直接运行�
 - **token 鉴权必须 `Authorization: Bearer`**：实测 `X-API-Key` 头在 v5.3.0 返回 403。
 - **token 不能用于 `auth/` 端点**（403），验证 token 改为探测 `/api/v2/app/version`。
 - **`editTracker` 参数是 `hash` + `url`（旧地址）+ `newUrl`**：`origUrl` 属于 editWebSeed，别混用。
+- **跳过校验的参数名在 5.3.0 变了**：`torrents/add` 的 `skip_checking` 改名 `seedMode`，且服务端对不认识的参数**静默忽略**（HTTP 依然成功）。新旧名字必须一起发。
+- **`paused` 在 5.3.0 改名 `stopped`**：不发时跟随全局偏好 `add_stopped_enabled`（本机为 `true`），种子会被直接加成 `stoppedUP`，即用户看到的「暂停状态」。同样双发，并显式置 `false`。
+- **`torrents/delete` 是异步的**：`removeTorrent` 只把种子摘出会话，libtorrent 移除完成前重加同 hash 会被 `duplicate_is_error` 静默丢弃（上游 #24367）。必须轮询 `torrents/info?hash=` 确认消失后再重加。
+- **`torrents/add` 现在返回 JSON 计数**：`success_count`/`failure_count`/`pending_count`/`added_torrent_ids`；有 pending 时 HTTP **202**，一条都没加时 **409**。只判 `== 200` 会把成功当失败。
+- **AutoTMM 打开时不要发 `savepath`**：服务端见 `savepath` 会隐式关闭 AutoTMM（`initLoadTorrentParams`），改发 `autoTMM=true`。
 - Windows 控制台是 GBK，脚本打印 emoji 前必须 `sys.stdout.reconfigure(encoding='utf-8', errors='replace')`。
-- 大量种子（4 万+）时 `torrents/info` 响应数十 MB，读取超时需放宽到 60s。
+- 大量种子（4 万+）时 `torrents/info` 响应数十 MB，读取超时需放宽到 60s；单种子复核用 `torrents/info?hashes=<hash>`，勿反复拉全量。
 
 ## 当前状态
 
@@ -43,3 +48,6 @@ Python 3 + requests + pandas + openpyxl。无测试、无构建，直接运行�
 - 2026-11-01：三个脚本统一接入 `qb_auth.py` 鉴权；新增 tracker 域名批量替换脚本并完成 `t.hddolby.com` → `www.uhddolby.com` 共 408 个种子迁移。
 - 2026-11-01：修复 tagger 漏标问题——错误状态码判定改为 `>= 4`，`已删种` 增补中文模式（`种子不存在` 等），
   `站点不可达` 增补中文连接错误，`无权限` 增补客户端封禁，`服务端异常` 增补 `Not Found`/bencode 失败。
+- 2026-11-07：修复 5.3.0 升级后跳过校验失效（`seedMode`/`stopped` 改名 + 异步删除竞态 + 202/409 判定）；
+  重加时回填分类/标签/限速/分享率等属性，并增加逐条复核与失败留档 `skip_check_backup/`。
+  实测 8.09GB 种子 3.6s 完成且属性无损；**注意本地做种时长与上传量会被删除重加清零**。

@@ -1,6 +1,6 @@
 # qBittorrent 工具集
 
-本仓库包含两个 qBittorrent Web API 辅助脚本：跳过校验与 tracker 错误分类打标签。
+本仓库包含三个 qBittorrent Web API 辅助脚本：跳过校验、tracker 错误分类打标签、tracker 域名批量替换。
 
 ## 脚本一览
 
@@ -97,6 +97,7 @@ token 鉴权**对脚本单次运行的性能提升非常有限**，主要价值�
 | `--out`         | 输出 Excel 文件名                                   |
 | `--skip-check`  | 跳过校验中的种子                                    |
 | `--skip-forced` | 跳过强制做种的种子                                  |
+| `--backup-dir`  | 重加失败时存放 .torrent 的目录，默认 `skip_check_backup/`（仅在确实失败时才创建） |
 
 ### 过滤选项说明
 
@@ -205,9 +206,35 @@ python qbittorrent-tracker-url-replacer.py --host ... --token qbt_xxx \
 
 该脚本通过以下步骤跳过种子校验：
 
-1. **导出种子文件** - 从 qBittorrent 获取种子文件
-2. **删除种子** - 删除原种子（保留文件）
-3. **重新导入** - 使用 `skip_checking=true` 参数重新导入，从而跳过校验
+1. **导出种子文件** — 从 qBittorrent 导出原始 .torrent（含 tracker 与 passkey）。导出失败或内容不是合法 bencode 时直接跳过该种子，不做任何改动
+2. **删除种子** — 删除原种子记录（`deleteFiles=false`，保留文件）
+3. **等待删除完成** — 5.x 的删除是异步的，轮询确认该 hash 已从会话消失后才继续；没消失就重加会被 libtorrent 判为 duplicate 而**静默丢弃**（HTTP 仍返回成功）
+4. **重新导入** — 带上跳过校验参数重加，并显式要求立即启动
+5. **逐条复核** — 轮询确认种子回到会话且进入做种态，才计入「成功」；仍在校验的记为「存疑」
+
+### qBittorrent 5.3.0（WebAPI v2.16）的参数改名
+
+| 用途 | ≤ 5.2 参数名 | 5.3.0 参数名 | 说明 |
+| ---- | ------------ | ------------ | ---- |
+| 跳过校验 | `skip_checking` | `seedMode` | 5.3.0 起只解析 `seedMode`，旧名字被静默忽略 → 表现为「重加成功但仍在校验」 |
+| 加入后是否停止 | `paused` | `stopped` | 不发时跟随全局偏好 `add_stopped_enabled`；该偏好为 `true` 时新种子被加成 `stoppedUP`（即「暂停状态」） |
+
+脚本对这两组**新旧名字一起发**，任何一端只会解析自己认识的那个，因此同一份脚本在 4.6 / 5.0 / 5.3.0 上都能用。
+
+`torrents/add` 的返回也变了：成功返回 JSON 计数（`success_count` / `failure_count` / `pending_count` / `added_torrent_ids`），有 pending 时为 **202**，一条都没加进去时为 **409**。所以判定一律用 2xx 并解析 JSON，不能写死 200。
+
+### 重加时回填的属性
+
+分类、标签、保存路径、上传/下载限速、顺序下载、首尾优先、分享率限制、AutoTMM、显示名。
+AutoTMM 打开时**不发** `savepath`——服务端看到 `savepath` 会隐式关掉 AutoTMM，路径改由分类/默认规则推导。
+
+> `forced`（强制做种）故意不回填：解除强制做种正是 `--skip-forced` 的目的。
+
+### 代价与兜底
+
+- **本地统计会被清零**：删除重加后该种子的「已做种时间 / 本地上传量」从头计数（实测 8.09GB 种子重加后 `seeding_time` 只剩 7 秒）。站点侧统计走 announce，不受影响。
+- **重加失败时自动留档**：导出失败之外的任何失败（删除卡住、409、未被受理）都会把 .torrent 落到 `--backup-dir`（默认 `skip_check_backup/`），可手动导入找回，passkey 不会丢。
+
 
 ## 导出字段说明
 
@@ -237,8 +264,11 @@ python qbittorrent-tracker-url-replacer.py --host ... --token qbt_xxx \
 ## 注意事项
 
 1. **建议先使用预览模式**：确认无误后再添加 `--skip-check` 或 `--skip-forced` 执行
-2. **保留文件**：删除种子时默认保留文件，不会删除实际数据
-3. **API 兼容性**：需要 qBittorrent 开启 Web API
+2. **只处理目标状态**：仅触碰 `checkingDL` / `checkingUP`（以及 `--skip-forced` 时的 `forcedUP`），其余种子一律不动
+3. **保留文件**：删除种子时默认保留文件，不会删除实际数据
+4. **本地统计会清零**：跳过校验靠删除重加实现，该种子的本地做种时长与上传量会重新开始计数；站点侧记录不受影响
+5. **留意「存疑」计数**：汇总里的存疑表示重加后仍在慢慢校验，即跳过并未真正生效，需要人工确认而不是重复跑
+6. **API 兼容性**：需要 qBittorrent 开启 Web API
 
 ---
 

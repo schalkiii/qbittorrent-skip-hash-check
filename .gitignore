@@ -9,6 +9,8 @@ checking.xlsx
 forced.xlsx
 tracker_replace_result.xlsx
 tracker_replace_backup.json
+# 重加失败时留档的 .torrent（含 passkey），禁止入库
+skip_check_backup/
 
 # Python 缓存
 __pycache__/
