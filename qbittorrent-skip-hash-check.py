@@ -27,6 +27,11 @@
 #    删完立刻重加会被 duplicate_is_error 静默丢弃（HTTP 仍返回成功），故先轮询确认删除完成。
 # 4. torrents/add 成功可能返回 202（pending_count > 0），一条都没加进去时返回 409，
 #    判定一律用 2xx 并解析 JSON 里的 success/failure/pending 计数，不能写死 200。
+# 5. 批量流水线：每批先全部 add 完，再整批收敛复核（先添加、后检查），
+#    避免 N 个 0.5s 等待窗口串行累加；状态查询用 hashes 分片，绝不拉全量 info
+#    （本库全量约 89MB，服务端繁忙时需 10-30s）。
+# 6. 服务端大量种子同时校验时偶发连接重置或查询长尾，查询需分片重试；
+#    轮询保证至少 MIN_POLL_ROUNDS 轮完整查询，防止长尾吃掉超时窗口造成误判。
 
 # 过滤选项: checking, completed, forced, all
 
@@ -63,10 +68,15 @@ DONE_STATES = ('uploading', 'stalledUP', 'queuedUP', 'forcedUP', 'stoppedUP', 'p
 BAD_STATES = ('missingFiles', 'error', 'metaDL', 'forcedMetaDL')
 
 POLL_INTERVAL = 0.5       # 轮询间隔
-DELETE_WAIT_TIMEOUT = 30  # 等待删除真正完成的上限
-ADD_WAIT_TIMEOUT = 30     # 等待种子重加并进入做种态的上限
-ADD_RETRY_LIMIT = 3       # 重加未能落地时最多尝试几次
-RETRY_PAUSE = 2           # 每次重试前的等待，给 libtorrent 完成上一轮移除留出时间
+DELETE_WAIT_TIMEOUT = 60  # 等待删除真正完成的上限（整批共享，不是每个种子各等一次）
+ADD_WAIT_TIMEOUT = 60     # 等待重加并进入做种态的上限（整批共享）
+MIN_POLL_ROUNDS = 2       # 无论墙钟超时与否，至少完成几轮完整查询再下结论
+QUERY_RETRIES = 3         # 单次查询失败后的重试次数（服务端繁忙时偶发连接重置）
+QUERY_RETRY_PAUSE = 1.0   # 查询重试间隔
+ADD_RETRY_LIMIT = 3       # 重加未能落地时最多尝试几轮
+RETRY_PAUSE = 2           # 每轮重试前的共享退避，给 libtorrent 完成上一轮移除留出时间
+DEFAULT_BATCH_SIZE = 50   # 每批种子数；设为 1 即退化为逐条处理
+QUERY_SHARD_SIZE = 50     # 单次 info?hashes= 查询携带的 hash 上限
 
 
 def is_ok(response):
@@ -74,23 +84,73 @@ def is_ok(response):
     return 200 <= response.status_code < 300
 
 
-def find_torrent(client, torrent_hash):
-    """用 hashes 参数精确查询单个种子，避免每处理一个就拉一次全量（本库 4 万多种子）"""
-    response = client.get('/api/v2/torrents/info', params={'hashes': torrent_hash})
-    if not is_ok(response):
-        raise RuntimeError(f'查询种子状态失败: HTTP {response.status_code} {response.text[:200]}')
-    torrents = response.json()
-    return torrents[0] if torrents else None
+def chunked(items, size):
+    """按固定大小切片"""
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
-def wait_until_removed(client, torrent_hash, timeout=DELETE_WAIT_TIMEOUT):
-    """等待种子从会话中彻底消失——libtorrent 移除是异步的，没消失就重加必然被静默丢弃"""
+class QueryUnavailable(RuntimeError):
+    """状态查询重试后仍失败：结果未知，不能据此判定种子失败"""
+
+
+def query_states(client, hashes):
+    """
+    批量查询多个种子的状态，返回 {hash: torrent}。
+
+    用 hashes 精确查询而非拉全量（本库 4 万多种子，全量响应约 89MB 且服务端繁忙时
+    需 10-30s）。实测一次带 283 个 hash 的请求耗时显著高于分片，故按 QUERY_SHARD_SIZE
+    切分；调用方每轮只传仍未确认的 hash，查询量随收敛递减。
+
+    服务端在大量种子同时校验时偶发连接重置，故每个分片单独重试；全部耗尽时抛
+    QueryUnavailable，由调用方按「结果未知」处理，避免把查询故障误判为种子失败。
+    """
+    states = {}
+    for shard in chunked(list(hashes), QUERY_SHARD_SIZE):
+        if not shard:
+            continue
+        last_error = None
+        for attempt in range(QUERY_RETRIES):
+            try:
+                response = client.get('/api/v2/torrents/info', params={'hashes': '|'.join(shard)})
+                if not is_ok(response):
+                    raise RuntimeError(f'HTTP {response.status_code} {response.text[:200]}')
+                for torrent in response.json():
+                    states[torrent['hash']] = torrent
+                last_error = None
+                break
+            except Exception as error:
+                last_error = error
+                if attempt < QUERY_RETRIES - 1:
+                    time.sleep(QUERY_RETRY_PAUSE)
+        if last_error is not None:
+            raise QueryUnavailable(f'状态查询重试 {QUERY_RETRIES} 次仍失败: {last_error}')
+    return states
+
+
+def wait_batch_removed(client, hashes, timeout=DELETE_WAIT_TIMEOUT):
+    """
+    收敛式等待整批种子从会话中消失，返回 (仍残留的 hash 集合, 查询是否可靠)。
+
+    libtorrent 移除是异步的，未消失就重加会撞 duplicate 被静默丢弃。
+    整批共享一个等待窗口：每轮只查仍残留的 hash，而不是每个种子各等一轮。
+    墙钟超时可能因单次查询长尾而提前触发，故保证至少完成 MIN_POLL_ROUNDS 轮。
+    """
+    pending = set(hashes)
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        if find_torrent(client, torrent_hash) is None:
-            return True
+    rounds = 0
+    while pending:
+        try:
+            states = query_states(client, pending)
+        except QueryUnavailable as error:
+            print(f'⚠️ {error}')
+            return pending, False
+        pending = set(states) & pending
+        rounds += 1
+        if not pending or (rounds >= MIN_POLL_ROUNDS and time.time() >= deadline):
+            break
         time.sleep(POLL_INTERVAL)
-    return False
+    return pending, True
 
 
 def bool_str(value):
@@ -177,60 +237,73 @@ def reimport_with_skip_check(client, torrent, torrent_file):
     return parse_add_reply(response)
 
 
-def verify_skipped(client, torrent_hash, timeout=ADD_WAIT_TIMEOUT):
+def verify_batch(client, hashes, timeout=ADD_WAIT_TIMEOUT):
     """
-    确认种子已回到会话并进入做种态，返回 (结论, 说明)。
+    整批统一复核，返回 {hash: (结论, 说明)}。
 
-    结论取值：ok=已做种；suspect=仍在慢慢校验（说明跳过并未真正生效）；
-    missing=会话里查不到（这次 add 被静默丢弃，可重试）；failed=状态异常。
-    只认明确的完成态（DONE_STATES），不能改用"非校验态 + 进度 100%"判定：
-    刚重加时服务端会短暂返回 checkingResumeData，此时进度同样已经是 1，容易被误判成跳过成功。
+    与逐条复核的区别：所有种子共用同一个等待窗口，每轮只对未定论的 hash 发一次
+    批量查询；已定论的立即移出集合，后续轮次不再查它们。因此总耗时与种子数量
+    解耦，只取决于最慢那个种子，而不是 N 个等待窗口相加。
+
+    只认明确的完成态（DONE_STATES）：刚重加时服务端会短暂返回 checkingResumeData，
+    此时进度已经是 1，若改用「非校验态 + 进度 100%」判定会把未跳过的种子误判为成功。
     """
+    pending = set(hashes)
+    verdicts = {}
+    seen = set()
+    last_state = {}
     deadline = time.time() + timeout
-    seen = False
-    while time.time() < deadline:
-        current = find_torrent(client, torrent_hash)
-        if current is not None:
-            seen = True
+    rounds = 0
+    query_reliable = True
+
+    while pending:
+        try:
+            states = query_states(client, pending)
+        except QueryUnavailable as error:
+            # 查询故障不等于种子未落地，标为 suspect 交由人工/下一轮重试确认
+            print(f'⚠️ {error}')
+            query_reliable = False
+            break
+        for torrent_hash in list(pending):
+            current = states.get(torrent_hash)
+            if current is None:
+                continue
+            seen.add(torrent_hash)
             state = current.get('state', '')
+            last_state[torrent_hash] = state
             if state in BAD_STATES:
-                return 'failed', f'状态异常: {state}'
-            if state in DONE_STATES:
-                return 'ok', state
+                verdicts[torrent_hash] = ('failed', f'状态异常: {state}')
+                pending.discard(torrent_hash)
+            elif state in DONE_STATES:
+                verdicts[torrent_hash] = ('ok', state)
+                pending.discard(torrent_hash)
+        rounds += 1
+        if not pending or (rounds >= MIN_POLL_ROUNDS and time.time() >= deadline):
+            break
         time.sleep(POLL_INTERVAL)
 
-    if not seen:
-        return 'missing', '重加后未出现在会话中'
-    return 'suspect', f'等待超时，仍在校验: {current.get("state", "")}'
+    for torrent_hash in pending:
+        if not query_reliable:
+            verdicts[torrent_hash] = ('unknown', '状态查询失败，结果未知')
+        elif torrent_hash not in seen:
+            verdicts[torrent_hash] = ('missing', '重加后未出现在会话中')
+        else:
+            verdicts[torrent_hash] = ('suspect', f'等待超时，仍在校验: {last_state.get(torrent_hash, "")}')
+    return verdicts
 
 
-def reimport_and_confirm(client, torrent, torrent_file):
+def add_batch(client, records):
     """
-    重新导入并确认结果，返回 (结论, 说明)。
+    逐个提交 add（每个种子的回填参数不同，无法合并为单次请求），但提交后不等待。
 
-    会话层删除是同步的，libtorrent 层的原生句柄移除却是异步的：抢先 add 会撞上
-    duplicate_is_error 而被静默丢弃（上游 #24367），因此对 missing 与 409 都要退避重试。
+    返回 {hash: 是否受理}，复核统一交给 verify_batch。
     """
-    torrent_hash = torrent['hash']
-    detail = ''
-    for attempt in range(1, ADD_RETRY_LIMIT + 1):
-        accepted, accepted_detail = reimport_with_skip_check(client, torrent, torrent_file)
-        detail = accepted_detail
-
-        if accepted:
-            verdict, state_detail = verify_skipped(client, torrent_hash)
-            if verdict != 'missing':
-                return verdict, f'{detail} / {state_detail}'
-            detail = state_detail
-        elif not accepted_detail.startswith('重加被拒绝（409'):
-            # 非 409 的失败与删除未完成同类，重试没有意义
-            return 'failed', detail
-
-        if attempt < ADD_RETRY_LIMIT:
-            print(f'♻️ 第 {attempt} 次重加未确认成功（{detail}），{RETRY_PAUSE}s 后重试')
-            time.sleep(RETRY_PAUSE)
-
-    return 'suspect', f'{ADD_RETRY_LIMIT} 次重加后仍无法在会话中确认: {detail}'
+    submitted = {}
+    for record in records:
+        accepted, detail = reimport_with_skip_check(client, record['torrent'], record['file'])
+        record['last_detail'] = detail
+        submitted[record['torrent']['hash']] = accepted
+    return submitted
 
 
 def save_torrent_backup(backup_dir, torrent_name, torrent_hash, torrent_file):
@@ -248,61 +321,129 @@ def save_torrent_backup(backup_dir, torrent_name, torrent_hash, torrent_file):
     return backup_path
 
 
-def skip_reimport(client, torrents, backup_dir):
+def skip_reimport(client, torrents, backup_dir, batch_size=DEFAULT_BATCH_SIZE):
     """
-    删除并重新导入种子，用 seedMode（旧版为 skip_checking）跳过校验。
+    分阶段流水线批量跳过校验（每批内「先全部添加完，再整批统一检查」）：
 
-    返回 {'ok': [...], 'suspect': [...], 'failed': [...]}。suspect 指重试后仍未确认
-    （还在校验或压根没落地），failed 指明确失败或状态异常；两者都已备份 .torrent。
+      1. 导出并预落盘整批 .torrent（含 tracker 与 passkey，删除后无原件则无法恢复）
+      2. 一次请求批量删除整批
+      3. 整批共享一个等待窗口，确认全部从会话消失
+      4. 逐个提交 add，但提交后不等待
+      5. 整批收敛式统一复核，已定论的立即移出后续查询集合
+      6. 仅对未落地的少数条目做重试，退避同样整批共享
+
+    返回 {'ok': [...], 'suspect': [...], 'failed': [...]}。未确认成功的条目保留
+    .torrent 备份；已确认成功的备份自动清理，避免目录堆积。
     """
     results = {'ok': [], 'suspect': [], 'failed': []}
     total = len(torrents)
+    processed = 0
+    batch_count = (total + batch_size - 1) // batch_size
 
-    for index, torrent in enumerate(torrents, 1):
-        torrent_hash = torrent['hash']
-        torrent_name = torrent['name']
-        tag = f'[{index}/{total}]'
+    for batch_no, batch in enumerate(chunked(torrents, batch_size), 1):
+        print(f'--- 批次 {batch_no}/{batch_count}：{len(batch)} 个种子 ---')
 
-        # 导出种子文件（含 tracker 与 passkey，比从种子目录复制可靠）
-        # 删除前必须确认导出可用：bencode 字典以 'd' 开头，否则一旦删完再重加就无路可退
-        response = client.get('/api/v2/torrents/export', params={'hash': torrent_hash})
-        if not is_ok(response) or not response.content or not response.content.startswith(b'd'):
-            print(f'❌ {tag} 获取种子文件失败，未做任何改动: {torrent_name} (HTTP {response.status_code})')
-            results['failed'].append(torrent)
+        # 阶段 1：导出并预落盘。导出失败的不参与后续删除，避免无路可退
+        records = []
+        for torrent in batch:
+            response = client.get('/api/v2/torrents/export', params={'hash': torrent['hash']})
+            if not is_ok(response) or not response.content or not response.content.startswith(b'd'):
+                print(f'❌ 获取种子文件失败，未做任何改动: {torrent["name"]} (HTTP {response.status_code})')
+                results['failed'].append(torrent)
+                continue
+            torrent_file = response.content
+            backup_path = save_torrent_backup(backup_dir, torrent['name'], torrent['hash'], torrent_file)
+            records.append({'torrent': torrent, 'file': torrent_file, 'backup': backup_path})
+
+        if not records:
+            processed += len(batch)
             continue
-        torrent_file = response.content
 
-        # 删除种子（保留文件）
+        by_hash = {r['torrent']['hash']: r for r in records}
+
+        # 阶段 2：一次请求批量删除
+        hashes = list(by_hash)
         response = client.post('/api/v2/torrents/delete',
-                               data={'hashes': torrent_hash, 'deleteFiles': 'false'})
+                               data={'hashes': '|'.join(hashes), 'deleteFiles': 'false'})
         if not is_ok(response):
-            print(f'❌ {tag} 删除种子失败 {torrent_name}: HTTP {response.status_code} {response.text[:200]}')
-            results['failed'].append(torrent)
+            print(f'❌ 批量删除失败 (HTTP {response.status_code} {response.text[:200]})，本批未重加')
+            for record in records:
+                results['failed'].append(record['torrent'])
+                print(f'    种子文件已备份: {record["backup"]}')
+            processed += len(batch)
             continue
 
-        # 等删除完成后再重加，否则会撞上同 hash 的 duplicate 而被静默丢弃
-        if not wait_until_removed(client, torrent_hash):
-            backup_path = save_torrent_backup(backup_dir, torrent_name, torrent_hash, torrent_file)
-            print(f'❌ {tag} 删除在 {DELETE_WAIT_TIMEOUT}s 内未完成，暂不重加: {torrent_name}')
-            print(f'    种子文件已备份: {backup_path}')
-            results['failed'].append(torrent)
+        # 阶段 3：整批共享一个等待窗口
+        still_present, query_reliable = wait_batch_removed(client, hashes)
+        if still_present:
+            reason = (f'删除在 {DELETE_WAIT_TIMEOUT}s 内未完成' if query_reliable
+                      else '删除状态查询失败，无法确认是否完成')
+            for torrent_hash in still_present:
+                record = by_hash.pop(torrent_hash)
+                print(f'❌ {reason}，暂不重加: {record["torrent"]["name"]}')
+                print(f'    种子文件已备份: {record["backup"]}')
+                results['failed'].append(record['torrent'])
+
+        if not by_hash:
+            processed += len(batch)
             continue
 
-        verdict, detail = reimport_and_confirm(client, torrent, torrent_file)
-        if verdict == 'ok':
-            print(f'✅ {tag} 已跳过校验: {torrent_name} → {detail}')
-            results['ok'].append(torrent)
-            continue
+        # 阶段 4-6：提交、整批复核、仅对未落地项重试
+        pending = list(by_hash.values())
+        final_verdicts = {}
+        for attempt in range(1, ADD_RETRY_LIMIT + 1):
+            submitted = add_batch(client, pending)
+            # 未被受理且非 409 的失败无需重试；409 与 missing 都是删除竞态，可重试
+            retryable = []
+            for record in pending:
+                torrent_hash = record['torrent']['hash']
+                if not submitted[torrent_hash]:
+                    if record['last_detail'].startswith('重加被拒绝（409'):
+                        retryable.append(record)
+                    else:
+                        final_verdicts[torrent_hash] = ('failed', record['last_detail'])
 
-        # 只要没确认成功就留档：此刻原记录已删除，而新记录可能压根没落地
-        backup_path = save_torrent_backup(backup_dir, torrent_name, torrent_hash, torrent_file)
-        if verdict == 'suspect':
-            print(f'⚠️ {tag} 结果存疑，需人工确认: {torrent_name}（{detail}）')
-            results['suspect'].append(torrent)
-        else:
-            print(f'❌ {tag} 重加未成功: {torrent_name}（{detail}）')
-            results['failed'].append(torrent)
-        print(f'    种子文件已备份，可手动重新导入: {backup_path}')
+            checkable = [r['torrent']['hash'] for r in pending if submitted[r['torrent']['hash']]]
+            verdicts = verify_batch(client, checkable) if checkable else {}
+            for torrent_hash, (verdict, detail) in verdicts.items():
+                # missing = add 被静默丢弃；unknown = 查询故障，两者都值得整批重试
+                if verdict in ('missing', 'unknown'):
+                    retryable.append(by_hash[torrent_hash])
+                else:
+                    final_verdicts[torrent_hash] = (verdict, detail)
+
+            pending = retryable
+            if not pending:
+                break
+            if attempt < ADD_RETRY_LIMIT:
+                print(f'♻️ 第 {attempt} 轮有 {len(pending)} 个种子未确认成功，{RETRY_PAUSE}s 后整批重试')
+                time.sleep(RETRY_PAUSE)
+
+        for record in pending:
+            final_verdicts[record['torrent']['hash']] = (
+                'suspect', f'{ADD_RETRY_LIMIT} 轮重加后仍无法在会话中确认: {record["last_detail"]}')
+
+        # 汇总本批：成功清理备份，其余保留并留档
+        for torrent_hash, record in by_hash.items():
+            verdict, detail = final_verdicts.get(torrent_hash, ('suspect', '未获得复核结论'))
+            torrent = record['torrent']
+            if verdict == 'ok':
+                results['ok'].append(torrent)
+                try:
+                    os.remove(record['backup'])
+                except OSError:
+                    pass
+                continue
+            if verdict == 'suspect':
+                print(f'⚠️ 结果存疑，需人工确认: {torrent["name"]}（{detail}）')
+                results['suspect'].append(torrent)
+            else:
+                print(f'❌ 重加未成功: {torrent["name"]}（{detail}）')
+                results['failed'].append(torrent)
+            print(f'    种子文件已备份，可手动重新导入: {record["backup"]}')
+
+        processed += len(batch)
+        print(f'--- 批次 {batch_no} 完成：累计 {processed}/{total} ---')
 
     return results
 
@@ -356,7 +497,11 @@ def main():
     p.add_argument('--skip-check', action='store_true', help='跳过所有正在校验的种子')
     p.add_argument('--skip-forced', action='store_true', help='跳过所有强制做种的种子')
     p.add_argument('--backup-dir', default='skip_check_backup',
-                   help='重加失败时存放导出 .torrent 的目录（仅在确实失败时才创建）')
+                   help='存放导出 .torrent 的目录（确认成功的备份会自动清理）')
+    p.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE,
+                   help=f'每批处理的种子数，默认 {DEFAULT_BATCH_SIZE}；设为 1 退化为逐条处理')
+    p.add_argument('--limit', type=int, default=0,
+                   help='最多处理多少个种子，0 表示不限制；用于小样本试验')
     
     args = p.parse_args()
     client = build_client_from_args(args)
@@ -371,23 +516,35 @@ def main():
 
 def run(client, args):
     torrents = fetch_torrents(client)
+    changed = False
 
     # 跳过校验中的种子
     if args.skip_check:
         checking_torrents = [t for t in torrents if t.get('state') in CHECKING_STATES]
-        print(f'待跳过校验: {len(checking_torrents)} 个')
+        if args.limit > 0:
+            checking_torrents = checking_torrents[:args.limit]
+        print(f'待跳过校验: {len(checking_torrents)} 个'
+              + (f'（--limit {args.limit} 小样本）' if args.limit > 0 else ''))
         if checking_torrents:
-            report_skip_result('跳过校验', skip_reimport(client, checking_torrents, args.backup_dir))
-        torrents = fetch_torrents(client)  # 重新获取最新状态
+            report_skip_result('跳过校验', skip_reimport(client, checking_torrents,
+                                                        args.backup_dir, args.batch_size))
+            changed = True
 
-    # 跳过强制做种的种子
+    # 跳过强制做种的种子：forcedUP 与 checking 互斥，不受上一批影响，可复用同一份快照
     if args.skip_forced:
         forced_torrents = [t for t in torrents if t.get('state') == 'forcedUP']
+        if args.limit > 0:
+            forced_torrents = forced_torrents[:args.limit]
         print(f'待解除强制做种: {len(forced_torrents)} 个')
         if forced_torrents:
-            report_skip_result('解除强制做种', skip_reimport(client, forced_torrents, args.backup_dir))
-        torrents = fetch_torrents(client)  # 重新获取最新状态
-    
+            report_skip_result('解除强制做种', skip_reimport(client, forced_torrents,
+                                                            args.backup_dir, args.batch_size))
+            changed = True
+
+    # 仅在确实改动过种子后刷新一次全量快照；全量 info 约 89MB 且服务端繁忙时需 10-30s
+    if changed:
+        torrents = fetch_torrents(client)
+
     # 导出逻辑
     rows = []
     for t in torrents:
@@ -427,7 +584,10 @@ def run(client, args):
     if not rows:
         print('没有匹配的种子。')
         return
-    
+
+    if args.limit > 0:
+        rows = rows[:args.limit]
+
     df = pd.DataFrame(rows)
     df.to_excel(args.out, index=False)
     print(f'导出完成: {args.out} (共 {len(rows)} 条)')

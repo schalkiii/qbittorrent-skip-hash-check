@@ -40,7 +40,9 @@ Python 3 + requests + pandas + openpyxl。无测试、无构建，直接运行�
 - **`torrents/add` 现在返回 JSON 计数**：`success_count`/`failure_count`/`pending_count`/`added_torrent_ids`；有 pending 时 HTTP **202**，一条都没加时 **409**。只判 `== 200` 会把成功当失败。
 - **AutoTMM 打开时不要发 `savepath`**：服务端见 `savepath` 会隐式关闭 AutoTMM（`initLoadTorrentParams`），改发 `autoTMM=true`。
 - Windows 控制台是 GBK，脚本打印 emoji 前必须 `sys.stdout.reconfigure(encoding='utf-8', errors='replace')`。
-- 大量种子（4 万+）时 `torrents/info` 响应数十 MB，读取超时需放宽到 60s；单种子复核用 `torrents/info?hashes=<hash>`，勿反复拉全量。
+- 大量种子（4 万+）时全量 `torrents/info` 约 89MB，服务端繁忙需 10-30s；复核必须用 `torrents/info?hashes=` 按 50 个分片，勿拉全量。
+- **不要逐条轮询等待**：跳过校验采用批量流水线（先全部 add、再整批收敛复核），每轮只查未定论的 hash；逐条复核会让 N 个 0.5s 等待窗口相加。
+- 服务端大量种子同时校验时偶发连接重置与查询长尾（0.04-26.7s），查询需分片重试，并保证至少 2 轮完整查询再下结论。
 
 ## 当前状态
 
@@ -49,5 +51,7 @@ Python 3 + requests + pandas + openpyxl。无测试、无构建，直接运行�
 - 2026-11-01：修复 tagger 漏标问题——错误状态码判定改为 `>= 4`，`已删种` 增补中文模式（`种子不存在` 等），
   `站点不可达` 增补中文连接错误，`无权限` 增补客户端封禁，`服务端异常` 增补 `Not Found`/bencode 失败。
 - 2026-11-07：修复 5.3.0 升级后跳过校验失效（`seedMode`/`stopped` 改名 + 异步删除竞态 + 202/409 判定）；
-  重加时回填分类/标签/限速/分享率等属性，并增加逐条复核与失败留档 `skip_check_backup/`。
+  重加时回填分类/标签/限速/分享率等属性，并增加复核与失败留档 `skip_check_backup/`。
   实测 8.09GB 种子 3.6s 完成且属性无损；**注意本地做种时长与上传量会被删除重加清零**。
+- 2026-11-10：跳过校验改为批量流水线（`--batch-size` 默认 50、`--limit` 小样本），
+  先全部 add 再整批收敛复核；消除逐条串行等待与重复全量 `info` 拉取。
